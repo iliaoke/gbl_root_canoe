@@ -4,3 +4,4 @@ version=6.1
 versionCode=13
 author=caomi
 description=自动刷新bl相关分区到非活动槽位
+updateJson=https://raw.githubusercontent.com/superturtlee/gbl_root_canoe/main/targets/magisk_module/module/update.json
