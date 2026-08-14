@@ -68,18 +68,13 @@
  */
 
 #include "AutoGen.h"
-#include "BootStats.h"
 #include "LinuxLoaderLib.h"
 #include <FastbootLib/FastbootMain.h>
-#include <Library/DeviceInfo.h>
-#include <Library/DrawUI.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/PartitionTableUpdate.h>
 #include <Library/ShutdownServices.h>
 #include <Library/StackCanary.h>
 #include "Library/ThreadStack.h"
-#include <Library/HypervisorMvCalls.h>
-#include <Library/UpdateCmdLine.h>
 #include <Protocol/EFICardInfo.h>
 #include <Protocol/SimpleTextIn.h>
 #include "SuperFbMenu.h"
@@ -87,11 +82,6 @@
 #define MAX_APP_STR_LEN 64
 #define MAX_NUM_FS 10
 #define DEFAULT_STACK_CHK_GUARD 0xc0c0c0c0
-
-#if HIBERNATION_SUPPORT_NO_AES
-VOID BootIntoHibernationImage (BootInfo *Info,
-                               BOOLEAN *SetRotAndBootStateAndVBH);
-#endif
 
 /**
   Linux Loader Application EntryPoint
@@ -226,17 +216,6 @@ LinuxLoaderEntry (IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *SystemTable)
   Status = gBS->LocateProtocol (&gEfiMemCardInfoProtocolGuid, NULL,
                                   (VOID **)&CardInfo);
 
-  // Initialize verified boot & Read Device Info
-  Status = DeviceInfoInit ();
-  if (Status != EFI_SUCCESS) {
-    DEBUG ((EFI_D_ERROR, "Initialize the device info failed: %r\n", Status));
-    /*
-     * The boot menu product carries on regardless: presenting the menu is its
-     * entire job, and device info is only needed once fastboot is entered.
-     * Bailing out here would leave the user with a blank screen instead.
-     */
-  }
-
   Status = EnumeratePartitions ();
 
   if (EFI_ERROR (Status)) {
@@ -293,7 +272,6 @@ LinuxLoaderEntry (IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *SystemTable)
     SfbShowFastbootMode ();
     DEBUG ((EFI_D_INFO, "Boot menu requested fastboot\n"));
   }
-  FindPtnActiveSlot ();
 
 #ifdef AUTO_VIRT_ABL
   DEBUG ((EFI_D_INFO, "Rebooting the device.\n"));

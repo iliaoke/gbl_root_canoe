@@ -70,8 +70,6 @@
 
 [Sources]
 	LinuxLoader.c
-	hibernation/HibernationImageLoader.c
-	hibernation/Jumptokernel.s
 	SuperFbMenu.h
 	SuperFbFat.c
 	SuperFbStore.c
@@ -92,21 +90,14 @@
 	DxeServicesTableLib
 	UefiLib
 	UefiApplicationEntryPoint
-	CacheMaintenanceLib
 	ArmLib
-	ArmSmcLib
 	BaseLib
 	DebugLib
 	DevicePathLib
-	HobLib
-	PerformanceLib
 	DebugPrintErrorLevelLib
-	FdtLib
-	LibUfdt
 	TimerLib
 	StackCanary
 	FastbootLib
-	LzmaDecompressLib
 	PrintLib
 	MemoryAllocationLib
 	UefiRuntimeServicesTableLib
