@@ -13,104 +13,30 @@
 #define __SUPER_FB_MENU_H__
 
 #include <Uefi.h>
+#include <Protocol/BlockIo.h>
 #include <Protocol/DevicePath.h>
 #include <Protocol/SimpleFileSystem.h>
 
-/* The boot loader we look for on every FAT32 volume, and the optional ANSI
- * one-liner describing it. */
+#include "SuperFbEntryList.h"
+
+/* The removable-media boot loader looked for on every volume. */
 #define SFB_BOOT_FILE_PATH  L"\\EFI\\BOOT\\BOOTAA64.EFI"
-#define SFB_DESC_FILE_PATH  L"\\EFI\\DESC"
 
-/*
- * Optional file in a volume's root directory listing extra boot entries, one
- * per line:
- *
- *   <name>:<path relative to the boot root>
- *   %<name>:<path to another ENTRIES file relative to the boot root>
- *
- * e.g. "MEMTEST:EFI/MEMTEST.EFI". Either '/' or '\' separates path components,
- * a leading separator is optional, blank lines and lines starting with '#' are
- * ignored. A '$' prefix on the name marks a "no default" entry. Entries here
- * are listed alongside the auto-discovered boot loader.
- *
- * A line beginning with '%' names a submenu: the path points at another file in
- * the same BOOTENTRIES format whose entries are shown when the row is selected.
- * Paths inside that file are still relative to the boot root (the volume root
- * for FAT32, \efisp for ext4), not to the submenu file's own directory, and the
- * file may itself contain further '%' submenu rows, up to SFB_MAX_SUBMENU_DEPTH
- * levels deep.
- */
-#define SFB_BOOTENTRIES_PATH  L"\\BOOTENTRIES"
+/* Optional boot entry list in a volume's root directory (SuperFbEntryList.h
+ * describes the line format). */
+#define SFB_VOLUME_ENTRIES_PATH  L"\\ENTRIES.CFG"
 
-/*
- * Optional file, looked for in a boot entry's own directory, naming UEFI driver
- * images to load and start before that entry is launched. One path per line,
- * each relative to the volume root, same line syntax as BOOTENTRIES.
- */
-#define SFB_DRIVER_LIST_NAME  L"DRIVER.LIST"
-
-/* Upper bound on the BOOTENTRIES / DRIVER.LIST text files we will read. */
-#define SFB_LIST_MAX_BYTES    8192
+/* The stored, ordered boot entry list inside the efisp config container,
+ * and the temporary file it is rewritten through. */
+#define SFB_STORE_DIR_PATH       L"\\CONFIG"
+#define SFB_STORE_ENTRIES_PATH   L"\\CONFIG\\ENTRIES.CFG"
+#define SFB_STORE_TEMP_PATH      L"\\CONFIG\\ENTRIES.TMP"
 
 #define SFB_DESC_CHARS       48
-#define SFB_PATH_CHARS       256
-#define SFB_MAX_ENTRIES      24
 #define SFB_MAX_DIR_ENTRIES  128
 
-/* Deepest submenu nesting allowed. Bounds the recursion when a chain of
- * ENTRIES files points at one another; beyond this the menu shows "too deep"
- * rather than descending further. */
-#define SFB_MAX_SUBMENU_DEPTH  8
-
-#define SFB_NO_INDEX  ((UINTN)-1)
-
-typedef enum {
-  /* An EFI application living on a FAT32/ext4 volume. */
-  SfbEntryEfiFile = 0,
-  /* A pointer to another ENTRIES file: selecting it opens that file as a
-   * submenu. Volume/Path name the ENTRIES file; Desc is the submenu title. */
-  SfbEntrySubmenu,
-  /* Built-in entries; no backing file, handled in code. */
-  SfbEntryFastboot,
-  SfbEntrySelector,
-  /* "Back" row at the foot of a submenu: returns to the parent menu. */
-  SfbEntryBack,
-  /* Power management actions offered at the end of the menu and on the
-   * fastboot mode screen. */
-  SfbEntryPowerOff,
-  SfbEntryRestart
-} SFB_ENTRY_KIND;
-
-typedef struct {
-  SFB_ENTRY_KIND            Kind;
-  /* TRUE when the entry was restored from the custom-entry store record
-   * rather than discovered by scanning. */
-  BOOLEAN                   IsCustom;
-  /* TRUE for entries whose BOOTENTRIES name began with '$': they are listed and
-   * bootable, but selecting one never overwrites the saved default. */
-  BOOLEAN                   NoDefault;
-  CHAR16                    Desc[SFB_DESC_CHARS];
-  CHAR16                    Path[SFB_PATH_CHARS];
-  /* FAT volume label the entry lives on; how a stored entry finds its way
-   * back to a volume after a reboot has renumbered the handles. */
-  CHAR16                    VolLabel[SFB_DESC_CHARS];
-  EFI_HANDLE                Volume;
-  /* Owned by the entry; NULL for the built-in kinds. */
-  EFI_DEVICE_PATH_PROTOCOL  *DevicePath;
-} SFB_BOOT_ENTRY;
-
-typedef struct {
-  SFB_BOOT_ENTRY  Entry[SFB_MAX_ENTRIES];
-  UINTN           Count;
-  /* Entry the menu highlights first, or SFB_NO_INDEX. This may be the stored
-   * default or, absent one, the first on-device entry used as a starting
-   * point for the cursor and the "*" marker. */
-  UINTN           DefaultIndex;
-  /* TRUE only when DefaultIndex came from a stored default record, not from
-   * the first-entry fallback. A power-on with no key pressed boots the default
-   * straight away only when this is TRUE; otherwise the menu is shown. */
-  BOOLEAN         DefaultIsPersisted;
-} SFB_MENU_STATE;
+/* Deepest name hierarchy the menu descends into. */
+#define SFB_MAX_MENU_DEPTH   8
 
 typedef enum {
   SfbKeyTimeout = 0,
@@ -131,35 +57,23 @@ EFI_STATUS
 SfbStartFatStack (VOID);
 
 /*
- * Snapshot of the boot volumes currently in the system: FAT32 volumes plus the
- * ext4 persist partition. *Handles must be released with FreePool ().
- *
- * Handles whose media is neither FAT32 nor ext4 are dropped: the menu and the
- * browser are specified in terms of those, and a platform's firmware may well
- * publish Simple File System over things this loader has no business writing
- * to or offering as boot media. An ext4 volume is also dropped unless it carries
- * a \efisp directory: that is its boot root, so without it there is nothing to
- * scan or browse, and the browser must not list it.
+ * The volume list IS the UFS partition table plus the efisp config container:
+ * the only volumes this loader ever enumerates, shared by the boot entry
+ * scan, the file browser and the Volumes menu. Only entries with a supported
+ * file system (FAT of any width or ext4) are returned. Firmware volumes, USB
+ * media and all other non-UFS disks never appear. *Handles must be released
+ * with FreePool ().
  */
 EFI_STATUS
 SfbLocateVolumes (OUT EFI_HANDLE **Handles, OUT UINTN *Count);
 
-/* TRUE when the volume handle's block device holds a FAT32 file system. */
+/* TRUE when the volume handle's block device holds a FAT12/16/32 volume. */
 BOOLEAN
-SfbIsFat32Volume (IN EFI_HANDLE Volume);
+SfbIsFatVolume (IN EFI_HANDLE Volume);
 
 /* TRUE when the volume handle's block device holds an ext4 file system. */
 BOOLEAN
 SfbIsExt4Volume (IN EFI_HANDLE Volume);
-
-/*
- * The volume-relative directory that acts as the boot root: "" for FAT32 (its
- * root already is) and "\efisp" for the ext4 persist partition. The scanner
- * prepends this to \EFI\BOOT\BOOTAA64.EFI and friends; the browser starts
- * browsing here.
- */
-CONST CHAR16 *
-SfbVolumeRootPrefix (IN EFI_HANDLE Volume);
 
 EFI_STATUS
 SfbOpenVolumeRoot (IN EFI_HANDLE Volume, OUT EFI_FILE_PROTOCOL **Root);
@@ -195,93 +109,87 @@ SfbIsEfiDriverFile (IN EFI_FILE_PROTOCOL *Root, IN CONST CHAR16 *Path);
 VOID
 SfbConnectAll (VOID);
 
-/*
- * Read an ANSI text file and return its first line as a Unicode string.
- * Out is left untouched when the file is missing or empty.
- */
-VOID
-SfbReadAnsiDescription (IN EFI_FILE_PROTOCOL *Root,
-                        IN CONST CHAR16      *Path,
-                        OUT CHAR16           *Out,
-                        IN UINTN             OutChars);
-
 /* FAT volume label, or an empty string when unavailable. */
 VOID
 SfbGetVolumeLabel (IN EFI_FILE_PROTOCOL *Root,
                    OUT CHAR16           *Out,
                    IN UINTN             OutChars);
 
-/* ---- SuperFbStore.c: settings kept in the tail of the ESP ---------------- */
-
 /*
- * The firmware on this platform rejects variables it does not know, so the two
- * things the menu has to remember outlive a reboot in the EFI System Partition
- * instead: two 1 KiB NUL-padded ASCII records written to the very end of the
- * partition, which is the only part of it that is safe to touch.
- */
-#define SFB_STORE_SLOT_BYTES  1024
-#define SFB_STORE_SLOTS       2
-
-#define SFB_STORE_DEFAULT  0   /* the entry the menu timeout launches */
-#define SFB_STORE_CUSTOM   1   /* the single user-added menu entry */
-
-/*
- * Replace one record. Text is NUL-terminated ASCII of at most
- * SFB_STORE_SLOT_BYTES - 1 bytes; passing an empty string clears the slot.
+ * (disk, partition) address of a volume in the volume table, both 0-based:
+ * disk is the UFS LUN number (lun0 = disk 0, lun1 = disk 1, ...), partition
+ * is the index of the partition in Ptable[Lun]. The efisp config container is
+ * appended as the last disk (one past the highest LUN with partitions) at
+ * part 0. EFI_NOT_FOUND for any handle outside the table.
  */
 EFI_STATUS
-SfbStoreWrite (IN UINTN Slot, IN CONST CHAR8 *Text);
+SfbGetVolumeAddress (IN EFI_HANDLE Volume, OUT UINT32 *Disk, OUT UINT32 *Part);
+
+/* The volume at (Disk, Part), or NULL. */
+EFI_HANDLE
+SfbFindVolumeByAddress (IN UINT32 Disk, IN UINT32 Part);
+
+/* ---- SuperFbEntries.c: boot entries, persistence and launching ---------- */
+
+/* The one in-memory boot entry list the boot flow, menu and Advanced share. */
+SFB_ENTRY_LIST *
+SfbEntries (VOID);
 
 /*
- * Read one record. Out is always NUL-terminated, and empty when the slot has
- * never been written. Fails only when the store itself is unreachable.
+ * Replace List with CONFIG\ENTRIES.CFG from the config container, in file
+ * order. A missing file or unavailable store yields an empty list; entries
+ * whose volume is absent stay in the list unresolved.
  */
 EFI_STATUS
-SfbStoreRead (IN UINTN Slot, OUT CHAR8 *Out, IN UINTN OutBytes);
+SfbLoadStoredEntries (IN OUT SFB_ENTRY_LIST *List);
 
-/* ---- SuperFbEntries.c: entry list, persistence and launching ------------ */
+/*
+ * Scan every supported volume (EFI\BOOT\BOOTAA64.EFI and root ENTRIES.CFG)
+ * and sync List with what was found: invalid entries are removed, valid ones
+ * keep their order, new ones are appended. TRUE in *Changed when List moved.
+ */
+EFI_STATUS
+SfbUpdateEntries (IN OUT SFB_ENTRY_LIST *List, OUT BOOLEAN *Changed OPTIONAL);
 
+/*
+ * Rewrite CONFIG\ENTRIES.CFG from List, atomically: temporary file, flush,
+ * delete, rename, flush. Fails without side effects on boot when the store is
+ * unavailable.
+ */
+EFI_STATUS
+SfbWriteStoredEntries (IN CONST SFB_ENTRY_LIST *List);
+
+/*
+ * Steps 1-5 of the power-on flow, everything before the boot menu: load the
+ * stored entries (scanning and storing when there are none), and, unless the
+ * menu was requested or there is nothing to boot, try each entry in order,
+ * dropping the ones whose image is not a loadable PE/COFF. Returns when the
+ * boot menu should run.
+ */
 VOID
-SfbBuildMenu (OUT SFB_MENU_STATE *Menu);
+SfbRunStartup (IN BOOLEAN MenuRequested);
+
+/* Fill in an entry for PathOnVolume on Volume, addressed by its (d,p). */
+EFI_STATUS
+SfbMakeFileEntry (IN EFI_HANDLE        Volume,
+                  IN CONST CHAR16      *PathOnVolume,
+                  IN CONST CHAR16      *Name,
+                  OUT SFB_BOOT_ENTRY   *Entry);
 
 /*
- * Build a submenu from an ENTRIES file at EntriesPath (an absolute volume path
- * on Volume) and append a trailing "Back" row. The ENTRIES file has the same
- * format as BOOTENTRIES, and every path inside it is resolved relative to the
- * same boot root (volume root for FAT32, \efisp for ext4). Returns
- * EFI_INVALID_PARAMETER for a null Volume/path; EFI_SUCCESS otherwise (an empty
- * or unreadable file simply yields a menu holding only "Back").
- */
-EFI_STATUS
-SfbBuildSubMenu (OUT SFB_MENU_STATE *Menu,
-                 IN EFI_HANDLE      Volume,
-                 IN CONST CHAR16    *EntriesPath);
-
-VOID
-SfbFreeMenu (IN OUT SFB_MENU_STATE *Menu);
-
-/* Persist Entry as the entry the menu timeout launches. */
-EFI_STATUS
-SfbSaveDefaultEntry (IN CONST SFB_BOOT_ENTRY *Entry);
-
-/* Persist Entry as the single user-added boot menu entry, replacing any
- * previous one. */
-EFI_STATUS
-SfbSaveCustomEntry (IN CONST SFB_BOOT_ENTRY *Entry);
-
-/*
- * Load and start the image the entry points at. Records the entry as the new
- * default first unless Temporary is TRUE. Only returns if the launch failed or
- * the started image returned.
+ * Load and start the image the entry points at. Only returns if the launch
+ * failed or the started image returned. *NotPeImage is set TRUE when LoadImage
+ * refused the file as an unsupported (non-PE/COFF or foreign-architecture)
+ * image; EFI_NOT_FOUND, EFI_SECURITY_VIOLATION and the like leave it FALSE.
  *
  * ClearScreen controls the "Booting <name>" banner: TRUE clears the screen
  * first (menu-driven launch), FALSE leaves the current screen contents in place
- * (unattended default boot, which must not blank the boot splash).
+ * (unattended boot, which must not blank the boot splash).
  */
 EFI_STATUS
 SfbLaunchEntry (IN CONST SFB_BOOT_ENTRY *Entry,
-                IN BOOLEAN              Temporary,
-                IN BOOLEAN              ClearScreen);
+                IN BOOLEAN              ClearScreen,
+                OUT BOOLEAN             *NotPeImage OPTIONAL);
 
 /*
  * Load and start a single UEFI driver image named by a volume-relative path.
@@ -290,26 +198,6 @@ SfbLaunchEntry (IN CONST SFB_BOOT_ENTRY *Entry,
  */
 EFI_STATUS
 SfbLoadDriver (IN EFI_HANDLE Volume, IN CONST CHAR16 *Path);
-
-/*
- * Launch the stored default entry, if one is configured. Returns TRUE when a
- * persisted default existed and was attempted (on success the launched image
- * takes over and this never returns; on failure it returns TRUE and the caller
- * should fall back to the menu). Returns FALSE when no default is configured,
- * so the caller shows the menu instead.
- */
-BOOLEAN
-SfbLaunchDefaultEntry (VOID);
-
-/* Fill in an entry describing PathOnVolume on Volume. */
-EFI_STATUS
-SfbMakeFileEntry (IN EFI_HANDLE        Volume,
-                  IN CONST CHAR16      *PathOnVolume,
-                  IN CONST CHAR16      *Desc,
-                  OUT SFB_BOOT_ENTRY   *Entry);
-
-VOID
-SfbFreeEntry (IN OUT SFB_BOOT_ENTRY *Entry);
 
 /* ---- SuperFbMenu.c: console UI ----------------------------------------- */
 
@@ -326,6 +214,15 @@ SfbRunBootMenu (VOID);
 /* Simple FAT32 browser: pick a volume, walk directories, act on a .efi. */
 VOID
 SfbRunFileBrowser (VOID);
+
+/*
+ * Browse one volume from an absolute path on it; VolumeLabel names the screen.
+ * Returns TRUE when the caller should unwind back to the boot menu.
+ */
+BOOLEAN
+SfbBrowseVolume (IN EFI_HANDLE   Volume,
+                 IN CONST CHAR16 *VolumeLabel,
+                 IN CONST CHAR16 *BrowseRoot);
 
 /*
  * Clear the console and announce fastboot. Called on the way out of the menu so
@@ -353,6 +250,22 @@ SfbShowEnteringMenu (VOID);
  */
 VOID
 SfbShowBootingScreen (IN CONST CHAR16 *Name, IN BOOLEAN ClearScreen);
+
+/*
+ * Clear the console, show "Entering <What>", and hold for one second so a
+ * volume key held from the parent screen is released before the submenu starts
+ * taking input. The input buffer is drained afterwards so that held key does
+ * not leak in as a spurious keypress.
+ */
+VOID
+SfbShowEnteringScreen (IN CONST CHAR16 *What);
+
+/*
+ * Debounce a menu exit (Back): hold briefly and drain the input queue so the
+ * confirming key cannot act on the parent menu.
+ */
+VOID
+SfbDebounceMenuExit (VOID);
 
 /* Wait for a key. TimeoutMs of 0 waits indefinitely. */
 SFB_KEY

@@ -1,9 +1,16 @@
+.PHONY: clean build tools tools-clean securefastboot securefastboot-clean
+
 clean:
 	rm -rf edk2/Build || true
 	rm -rf edk2/Conf || true
 	rm -rf ./build || true
 build:
 	cp -r ./Conf ./edk2/
+	# This vendor EDK2 build has reused objects after included headers changed
+	# (stale limits survive header updates). A fresh final EFI alone does not
+	# prove fresh code: rebuild the full BDS output tree.
+	rm -rf edk2/Build/RELEASE_CLANG35
+	rm -f ./build/BDS.efi
 	bash -c 'cd edk2 && . ./edksetup.sh && make BOARD_BOOTLOADER_PRODUCT_NAME=canoe TARGET_ARCHITECTURE=AARCH64 TARGET=RELEASE \
   		CLANG_BIN=/usr/bin/ CLANG_PREFIX=aarch64-linux-gnu- VERIFIED_BOOT_ENABLED=1 \
   		VERIFIED_BOOT_LE=0 AB_RETRYCOUNT_DISABLE=0 TARGET_BOARD_TYPE_AUTO=0 \
@@ -17,6 +24,14 @@ build:
 	fi
 	mkdir -p ./build
 	cp edk2/Build/RELEASE_CLANG35/AARCH64/LinuxLoader.efi ./build/BDS.efi
+	# efisp holds BDS in its first 1 MiB and the config FAT container after
+	# it. BDS is flashed by its own length (never padded), so it must stay
+	# strictly below 1 MiB or flashing it would overwrite the container.
+	@size=$$(wc -c < ./build/BDS.efi); \
+	if [ "$$size" -ge 1048576 ]; then \
+		echo "BDS.efi is $$size bytes; it must be smaller than 1 MiB"; \
+		exit 1; \
+	fi
 	@echo "BDS built successfully: build/BDS.efi"
 
 # Build the standalone AndroidToolsPkg applications (RebootTools, ArbTools,
@@ -26,6 +41,8 @@ build:
 # CLANG35 toolchain and BaseTools resolve identically.
 tools:
 	cp -r ./Conf ./edk2/ 2>/dev/null || true
+	# Remove all standalone-tool outputs so EDK2 cannot reuse a stale artifact.
+	rm -rf edk2/Build/AndroidToolsPkg
 	bash -c 'cd edk2 && . ./edksetup.sh && make tools BOARD_BOOTLOADER_PRODUCT_NAME=canoe TARGET_ARCHITECTURE=AARCH64 TARGET=RELEASE \
   		CLANG_BIN=/usr/bin/ CLANG_PREFIX=aarch64-linux-gnu- VERIFIED_BOOT_ENABLED=1 \
   		VERIFIED_BOOT_LE=0 AB_RETRYCOUNT_DISABLE=0 TARGET_BOARD_TYPE_AUTO=0 \
@@ -48,4 +65,31 @@ tools-clean:
   		CLANG_BIN=/usr/bin/ CLANG_PREFIX=aarch64-linux-gnu- \
   		PREBUILT_HOST_TOOLS="BUILD_CC=clang BUILD_CXX=clang++ LDPATH=-fuse-ld=lld BUILD_AR=llvm-ar"' || true
 	rm -f ./build/RebootTools.efi ./build/ArbTools.efi ./build/BLTools.efi || true
+
+# Build the standalone SecureFastbootPkg preload wrapper. It lives in the
+# config container (persist/efisp) and is chainloaded by the BDS, so it is
+# deliberately not part of the BDS image. Same toolchain env as `build`.
+securefastboot:
+	cp -r ./Conf ./edk2/ 2>/dev/null || true
+	rm -rf edk2/Build/SecureFastbootPkg
+	bash -c 'cd edk2 && . ./edksetup.sh && make securefastboot BOARD_BOOTLOADER_PRODUCT_NAME=canoe TARGET_ARCHITECTURE=AARCH64 TARGET=RELEASE \
+		CLANG_BIN=/usr/bin/ CLANG_PREFIX=aarch64-linux-gnu- VERIFIED_BOOT_ENABLED=1 \
+		VERIFIED_BOOT_LE=0 AB_RETRYCOUNT_DISABLE=0 TARGET_BOARD_TYPE_AUTO=0 \
+		BUILD_USES_RECOVERY_AS_BOOT=0 DISABLE_PARALLEL_DOWNLOAD_FLASH=0 PVMFW_BCC_ENABLED=-DPVMFW_BCC \
+		REMOVE_CARVEOUT_REGION=1 QSPA_BOOTCONFIG_ENABLE=1 USER_BUILD_VARIANT=0 TEST_ADAPTER=1 \
+		PREBUILT_HOST_TOOLS="BUILD_CC=clang BUILD_CXX=clang++ LDPATH=-fuse-ld=lld BUILD_AR=llvm-ar"' || true
+	@SRC=edk2/Build/SecureFastbootPkg/RELEASE_CLANG35/AARCH64/SecureFastboot.efi; \
+	if [ ! -f $$SRC ]; then \
+		echo "SecureFastbootPkg build failed"; \
+		exit 1; \
+	fi
+	mkdir -p ./build
+	cp edk2/Build/SecureFastbootPkg/RELEASE_CLANG35/AARCH64/SecureFastboot.efi ./build/SecureFastboot.efi
+	@echo "SecureFastboot built successfully: build/SecureFastboot.efi"
+
+securefastboot-clean:
+	bash -c 'cd edk2 && . ./edksetup.sh && make securefastboot-clean TARGET_ARCHITECTURE=AARCH64 TARGET=RELEASE \
+		CLANG_BIN=/usr/bin/ CLANG_PREFIX=aarch64-linux-gnu- \
+		PREBUILT_HOST_TOOLS="BUILD_CC=clang BUILD_CXX=clang++ LDPATH=-fuse-ld=lld BUILD_AR=llvm-ar"' || true
+	rm -f ./build/SecureFastboot.efi || true
 

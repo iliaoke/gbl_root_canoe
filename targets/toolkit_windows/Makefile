@@ -1,8 +1,10 @@
+.PHONY: clean copy_resources submodule_uefi submodule_patcher submodule_ablfvextractor build test
+
 clean:
 	rm -rf build || true
 copy_resources:
-	mkdir -p build/toolkit
 	mkdir -p build/toolkit/bin
+	mkdir -p build/toolkit/efisp/tools
 	cp -r resources/* build/toolkit/
 submodule_uefi: copy_resources
 	cd ../../submodules/uefi && make build && make tools
@@ -19,3 +21,7 @@ submodule_ablfvextractor: copy_resources
 build: submodule_uefi submodule_patcher submodule_ablfvextractor
 	# zip
 	cd build/toolkit && zip -r ../toolkit_windows.zip ./
+
+# Does not rebuild the unrelated UEFI payloads or touch a connected device.
+test: submodule_patcher submodule_ablfvextractor
+	python3 tests/test_wine.py

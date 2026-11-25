@@ -1,10 +1,11 @@
 /*
- * Embedded FAT stack for the super-fastboot boot menu.
+ * Volume support for the super-fastboot boot menu.
  *
- * EnhancedFatDxe, DiskIoDxe and the English Unicode Collation driver are linked
- * into this application as static libraries. Their entry points are invoked
- * here by hand rather than by the DXE dispatcher, then a connection pass lets
- * them bind to whatever Block I/O handles the platform published.
+ * FAT file systems come from the platform firmware's own FAT driver. The
+ * read-only EXT4 driver, DiskIoDxe and the English Unicode Collation driver
+ * are linked into this application as static libraries: their entry points
+ * are invoked here by hand rather than by the DXE dispatcher, then a
+ * connection pass binds them to the Block I/O handles the platform published.
  *
  * Copyright (c) 2026, contributors to the canoe ABL tree.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -16,6 +17,8 @@
 #include <Library/BaseMemoryLib.h>
 #include <Library/DebugLib.h>
 #include <Library/MemoryAllocationLib.h>
+#include <Library/PartitionTableUpdate.h>
+#include <Library/SfbConfigStore.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiLib.h>
 #include <Library/DevicePathLib.h>
@@ -43,11 +46,6 @@ EFI_STATUS
 EFIAPI
 InitializeDiskIo (IN EFI_HANDLE       ImageHandle,
                   IN EFI_SYSTEM_TABLE *SystemTable);
-
-EFI_STATUS
-EFIAPI
-FatEntryPoint (IN EFI_HANDLE       ImageHandle,
-               IN EFI_SYSTEM_TABLE *SystemTable);
 
 EFI_STATUS
 EFIAPI
@@ -131,10 +129,10 @@ SfbStartFatStack (VOID)
   }
 
   /*
-   * EnhancedFatDxe refuses to mount a volume without a Unicode Collation
-   * producer. This installs onto a handle of its own making, and a second
-   * producer alongside a platform-supplied one is harmless: the FAT driver
-   * picks whichever matches the platform language.
+   * Ext4Dxe needs a Unicode Collation producer and Disk I/O on the block
+   * handles. A second producer alongside a platform-supplied one is
+   * harmless: the driver picks whichever matches the platform language.
+   * FAT is already handled by the firmware, so no FAT driver is started.
    */
   Status = InitializeUnicodeCollationEng (gImageHandle, gST);
   if (EFI_ERROR (Status)) {
@@ -154,25 +152,12 @@ SfbStartFatStack (VOID)
     return Status;
   }
 
-  Status = SfbCreateDriverHandle (&FatHandle);
-  if (EFI_ERROR (Status)) {
-    DEBUG ((EFI_D_ERROR, "SFB: FAT handle alloc failed: %r\n", Status));
-    return Status;
-  }
-
-  Status = FatEntryPoint (FatHandle, gST);
-  if (EFI_ERROR (Status)) {
-    DEBUG ((EFI_D_ERROR, "SFB: FAT driver init failed: %r\n", Status));
-    return Status;
-  }
-
   /*
-   * The read-only EXT4 driver mounts the ext4 persist partition so its \efisp
-   * directory can be scanned and browsed like a FAT32 volume. Same pattern as
-   * FAT above: a private handle carries its driver binding, and the connect
-   * pass at the end binds it to the Disk I/O handles of any ext4 partitions.
-   * Failure here is non-fatal to the FAT stack already up, but the persist
-   * volume simply will not appear.
+   * The read-only EXT4 driver mounts ext4 partitions so they can be scanned
+   * and browsed like FAT volumes: a private handle carries its driver
+   * binding, and the connect pass at the end binds it to the Disk I/O
+   * handles of any ext4 partitions. Failure here is non-fatal; ext4 volumes
+   * simply will not appear.
    */
   Status = SfbCreateDriverHandle (&FatHandle);
   if (EFI_ERROR (Status)) {
@@ -222,19 +207,21 @@ SfbLe32 (IN CONST UINT8 *Sector, IN UINTN Offset)
 
 /*
  * Decide from the boot sector alone. The FAT type is defined by the geometry
- * rather than by the "FAT32" text at offset 82, which is documented as
- * informational only, so the geometry is what is checked; the text is accepted
- * as a second opinion for images that fill it in but lay out the BPB oddly.
+ * rather than by the "FAT16"/"FAT32" text, which is documented as informational
+ * only. Any FAT width is accepted here (FAT12/16 keep a 16-bit FAT size and a
+ * non-zero root entry count; FAT32 zeroes both and carries a 32-bit FAT size),
+ * because the efisp configuration container may be FAT12/16 while removable
+ * media are usually FAT32.
  */
 BOOLEAN
-SfbIsFat32Volume (IN EFI_HANDLE Volume)
+SfbIsFatVolume (IN EFI_HANDLE Volume)
 {
   EFI_STATUS             Status;
   EFI_BLOCK_IO_PROTOCOL  *BlockIo = NULL;
   UINT8                  *Sector;
   UINTN                  SectorSize;
   UINT16                 BytesPerSec;
-  BOOLEAN                IsFat32 = FALSE;
+  BOOLEAN                IsFat = FALSE;
 
   Status = gBS->HandleProtocol (Volume, &gEfiBlockIoProtocolGuid,
                                 (VOID **)&BlockIo);
@@ -277,31 +264,25 @@ SfbIsFat32Volume (IN EFI_HANDLE Volume)
     goto Done;
   }
 
-  /* FAT32 has no fixed-size root directory, no 16-bit FAT size and, past the
-   * 32MB mark, no 16-bit total sector count either. */
-  if (SfbLe16 (Sector, SFB_BPB_ROOT_ENT_CNT) == 0 &&
-      SfbLe16 (Sector, SFB_BPB_FAT_SZ_16) == 0 &&
-      SfbLe16 (Sector, SFB_BPB_TOT_SEC_16) == 0 &&
+  /* A FAT of any width always has a FAT size in exactly one of the two BPB
+   * fields. Anything else is not a FAT boot sector. */
+  if (SfbLe16 (Sector, SFB_BPB_FAT_SZ_16) != 0 ||
       SfbLe32 (Sector, SFB_BPB_FAT_SZ_32) != 0) {
-    IsFat32 = TRUE;
+    IsFat = TRUE;
     goto Done;
-  }
-
-  if (CompareMem (Sector + SFB_BPB_FS_TYPE_32, "FAT32   ", 8) == 0) {
-    IsFat32 = TRUE;
   }
 
 Done:
   FreeAlignedPages (Sector, EFI_SIZE_TO_PAGES (SectorSize));
 
-  return IsFat32;
+  return IsFat;
 }
 
 /*
  * The ext4 superblock sits 1024 bytes into the partition and carries the
  * 0xEF53 signature at offset 56 within it (byte 1080). FAT32 volumes answer
  * FALSE here: their first few KiB are a boot sector and FATs, never an ext4
- * superblock, so this and SfbIsFat32Volume () partition the volume set
+ * superblock, so this and SfbIsFatVolume () partition the volume set
  * cleanly and a handle is never both.
  */
 BOOLEAN
@@ -359,114 +340,6 @@ Done:
   return IsExt4;
 }
 
-/*
- * The subdirectory that plays the role of a FAT32 volume root on a given
- * volume: empty for genuine FAT32 (its root already is the scan root) and
- * \efisp for the ext4 persist partition, whose boot files live there. The
- * entry scanner and the browser prepend this to the well-known boot file
- * paths and use it as the browse floor respectively.
- */
-CONST CHAR16 *
-SfbVolumeRootPrefix (IN EFI_HANDLE Volume)
-{
-  return SfbIsExt4Volume (Volume) ? L"\\efisp" : L"";
-}
-
-/*
- * TRUE when Path names an existing directory on Volume. Ext4 volumes are only
- * treated as boot volumes when they carry \efisp, so an ext4 partition whose
- * \efisp directory has not been created is never scanned or offered in the
- * browser. FAT32 volumes are never gated on this: their root is the boot root.
- */
-STATIC
-BOOLEAN
-SfbVolumeHasDir (IN EFI_HANDLE Volume, IN CONST CHAR16 *Path)
-{
-  EFI_STATUS         Status;
-  EFI_FILE_PROTOCOL  *Root = NULL;
-  EFI_FILE_PROTOCOL  *Dir = NULL;
-  EFI_FILE_INFO      *Info;
-  UINTN              InfoSize;
-  BOOLEAN            IsDir = FALSE;
-
-  if (EFI_ERROR (SfbOpenVolumeRoot (Volume, &Root)) || Root == NULL) {
-    return FALSE;
-  }
-
-  Status = Root->Open (Root, &Dir, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
-  if (EFI_ERROR (Status) || Dir == NULL) {
-    Root->Close (Root);
-    return FALSE;
-  }
-
-  InfoSize = 0;
-  Status = Dir->GetInfo (Dir, &gEfiFileInfoGuid, &InfoSize, NULL);
-  if (Status == EFI_BUFFER_TOO_SMALL) {
-    Info = AllocateZeroPool (InfoSize);
-    if (Info != NULL) {
-      Status = Dir->GetInfo (Dir, &gEfiFileInfoGuid, &InfoSize, Info);
-      if (!EFI_ERROR (Status)) {
-        IsDir = (BOOLEAN)((Info->Attribute & EFI_FILE_DIRECTORY) != 0);
-      }
-      FreePool (Info);
-    }
-  }
-
-  Dir->Close (Dir);
-  Root->Close (Root);
-
-  return IsDir;
-}
-
-EFI_STATUS
-SfbLocateVolumes (OUT EFI_HANDLE **Handles, OUT UINTN *Count)
-{
-  EFI_STATUS  Status;
-  EFI_HANDLE  *All = NULL;
-  UINTN       AllCount = 0;
-  UINTN       Kept = 0;
-  UINTN       Index;
-
-  *Handles = NULL;
-  *Count = 0;
-
-  Status = gBS->LocateHandleBuffer (ByProtocol,
-                                    &gEfiSimpleFileSystemProtocolGuid,
-                                    NULL,
-                                    &AllCount,
-                                    &All);
-  if (EFI_ERROR (Status) || All == NULL) {
-    return EFI_ERROR (Status) ? Status : EFI_NOT_FOUND;
-  }
-
-  /* Filter in place: the buffer is ours, and the survivors keep their order.
-   * FAT32 volumes are the menu's traditional boot media; ext4 volumes are the
-   * persist partition, whose \efisp directory the scanner treats as a volume
-   * root via SfbVolumeRootPrefix (). An ext4 volume without \efisp is dropped:
-   * it has no boot root to scan and nothing to browse, so it would only clutter
-   * the menu. Anything else is dropped too. */
-  for (Index = 0; Index < AllCount; Index++) {
-    if (SfbIsFat32Volume (All[Index]) ||
-        (SfbIsExt4Volume (All[Index]) &&
-         SfbVolumeHasDir (All[Index], L"\\efisp"))) {
-      All[Kept++] = All[Index];
-    }
-  }
-
-  DEBUG ((EFI_D_INFO, "SFB: %u of %u file systems are FAT32/ext4\n",
-          (UINT32)Kept, (UINT32)AllCount));
-
-  if (Kept == 0) {
-    FreePool (All);
-    return EFI_NOT_FOUND;
-  }
-
-  *Handles = All;
-  *Count = Kept;
-
-  return EFI_SUCCESS;
-}
-
 EFI_STATUS
 SfbOpenVolumeRoot (IN EFI_HANDLE Volume, OUT EFI_FILE_PROTOCOL **Root)
 {
@@ -483,6 +356,159 @@ SfbOpenVolumeRoot (IN EFI_HANDLE Volume, OUT EFI_FILE_PROTOCOL **Root)
   }
 
   return Fs->OpenVolume (Fs, Root);
+}
+
+typedef struct {
+  EFI_HANDLE  Handle;
+  UINT32      Disk;
+  UINT32      Part;
+} SFB_VOLUME;
+
+STATIC EFI_STATUS SfbListVolumes (OUT SFB_VOLUME **Table, OUT UINTN *Count);
+
+EFI_STATUS
+SfbLocateVolumes (OUT EFI_HANDLE **Handles, OUT UINTN *Count)
+{
+  SFB_VOLUME  *Vols = NULL;
+  EFI_HANDLE  *List;
+  UINTN       VolCount = 0;
+  UINTN       Kept = 0;
+  UINTN       Index;
+
+  *Handles = NULL;
+  *Count = 0;
+
+  if (EFI_ERROR (SfbListVolumes (&Vols, &VolCount)) || VolCount == 0) {
+    return EFI_NOT_FOUND;
+  }
+
+  List = AllocateZeroPool (VolCount * sizeof (*List));
+  if (List == NULL) {
+    FreePool (Vols);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  /* The table IS the volume list; keep the entries that actually carry a
+   * supported file system so the boot-entry scan sees only mountable media. */
+  for (Index = 0; Index < VolCount; Index++) {
+    if (SfbIsFatVolume (Vols[Index].Handle) ||
+        SfbIsExt4Volume (Vols[Index].Handle)) {
+      List[Kept++] = Vols[Index].Handle;
+    }
+  }
+  FreePool (Vols);
+
+  if (Kept == 0) {
+    FreePool (List);
+    return EFI_NOT_FOUND;
+  }
+
+  *Handles = List;
+  *Count = Kept;
+  return EFI_SUCCESS;
+}
+
+/* ---- volume table -------------------------------------------------------- */
+
+/*
+ * The volume list IS the platform partition table: every Ptable[Lun] entry is
+ * a UFS partition handle, addressed as (Lun, j) - lun0 = disk 0, lun1 = disk
+ * 1, ... The efisp config container is appended as the last disk, one past
+ * the highest LUN that actually has partitions. No other volumes exist for
+ * this loader: firmware volumes, USB media and other non-UFS disks are never
+ * enumerated.
+ *
+ * The table is rebuilt on each call so a USB export session that refreshes
+ * Ptable is picked up immediately. *Table must be released with FreePool ().
+ */
+STATIC
+EFI_STATUS
+SfbListVolumes (OUT SFB_VOLUME **Table, OUT UINTN *Count)
+{
+  SFB_VOLUME  *Vols;
+  UINT32      Lun;
+  UINT32      MaxLuns = GetMaxLuns ();
+  UINT32      ConfigDisk = 0;
+  UINTN       Used = 0;
+  UINTN       j;
+  EFI_HANDLE  Config = NULL;
+
+  *Table = NULL;
+  *Count = 0;
+  Vols = AllocateZeroPool ((MAX_NUM_PARTITIONS + 1) * sizeof (*Vols));
+  if (Vols == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  for (Lun = 0; Lun < MaxLuns && Lun < MAX_LUNS; Lun++) {
+    for (j = 0; j < Ptable[Lun].MaxHandles; j++) {
+      if (Ptable[Lun].HandleInfoList[j].Handle != NULL) {
+        Vols[Used].Handle = Ptable[Lun].HandleInfoList[j].Handle;
+        Vols[Used].Disk = Lun;
+        Vols[Used].Part = (UINT32)j;
+        Used++;
+        if (Lun + 1 > ConfigDisk) {
+          ConfigDisk = Lun + 1;
+        }
+      }
+    }
+  }
+
+  (VOID)SfbConfigStoreGetFs (NULL, &Config);
+  if (Config != NULL) {
+    Vols[Used].Handle = Config;
+    Vols[Used].Disk = ConfigDisk;
+    Vols[Used].Part = 0;
+    Used++;
+  }
+
+  *Table = Vols;
+  *Count = Used;
+  return EFI_SUCCESS;
+}
+
+EFI_STATUS
+SfbGetVolumeAddress (IN EFI_HANDLE Volume, OUT UINT32 *Disk, OUT UINT32 *Part)
+{
+  SFB_VOLUME  *Vols = NULL;
+  UINTN       Count = 0;
+  UINTN       Index;
+  EFI_STATUS  Status = EFI_NOT_FOUND;
+
+  if (EFI_ERROR (SfbListVolumes (&Vols, &Count))) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+  for (Index = 0; Index < Count; Index++) {
+    if (Vols[Index].Handle == Volume) {
+      *Disk = Vols[Index].Disk;
+      *Part = Vols[Index].Part;
+      Status = EFI_SUCCESS;
+      break;
+    }
+  }
+  FreePool (Vols);
+  return Status;
+}
+
+EFI_HANDLE
+SfbFindVolumeByAddress (IN UINT32 Disk, IN UINT32 Part)
+{
+  SFB_VOLUME  *Vols = NULL;
+  UINTN       Count = 0;
+  UINTN       Index;
+  EFI_HANDLE  Found = NULL;
+
+  if (EFI_ERROR (SfbListVolumes (&Vols, &Count))) {
+    return NULL;
+  }
+  for (Index = 0; Index < Count; Index++) {
+    if (Vols[Index].Disk == Disk && Vols[Index].Part == Part) {
+      Found = Vols[Index].Handle;
+      break;
+    }
+  }
+  FreePool (Vols);
+  return Found;
 }
 
 BOOLEAN
@@ -600,55 +626,6 @@ SfbIsEfiDriverFile (IN EFI_FILE_PROTOCOL *Root, IN CONST CHAR16 *Path)
 
   return (BOOLEAN)(Subsystem == EFI_IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER ||
                    Subsystem == EFI_IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER);
-}
-
-VOID
-SfbReadAnsiDescription (IN EFI_FILE_PROTOCOL *Root,
-                        IN CONST CHAR16      *Path,
-                        OUT CHAR16           *Out,
-                        IN UINTN             OutChars)
-{
-  EFI_STATUS         Status;
-  EFI_FILE_PROTOCOL  *File = NULL;
-  CHAR8              Buffer[256];
-  UINTN              ReadSize;
-  UINTN              Index;
-
-  if (OutChars == 0) {
-    return;
-  }
-
-  Status = Root->Open (Root, &File, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
-  if (EFI_ERROR (Status) || File == NULL) {
-    return;
-  }
-
-  ReadSize = sizeof (Buffer);
-  Status = File->Read (File, &ReadSize, Buffer);
-  File->Close (File);
-
-  if (EFI_ERROR (Status) || ReadSize == 0) {
-    return;
-  }
-
-  /* First line only, and only printable 7-bit characters: the console cannot
-   * render anything else usefully and the file is specified as ANSI. */
-  for (Index = 0; Index < ReadSize && Index < OutChars - 1; Index++) {
-    CHAR8 Ch = Buffer[Index];
-
-    if (Ch == '\0' || Ch == '\r' || Ch == '\n') {
-      break;
-    }
-    if (Ch < 0x20 || (UINT8)Ch > 0x7e) {
-      Ch = ' ';
-    }
-    Out[Index] = (CHAR16)Ch;
-  }
-
-  /* Leave the caller's fallback in place rather than blanking it. */
-  if (Index > 0) {
-    Out[Index] = L'\0';
-  }
 }
 
 VOID

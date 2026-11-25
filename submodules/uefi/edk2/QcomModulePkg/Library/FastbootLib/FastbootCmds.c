@@ -66,6 +66,7 @@ found at
 #define PVMFW_CONFIG_MAX_BLOBS 2
 /* Return True if integer overflow will occur */
 #define CHECK_ADD64(a, b) ((MAX_UINT64 - b < a) ? TRUE : FALSE)
+#include "FastbootResponse.h"
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/BaseMemoryLib.h>
@@ -77,6 +78,7 @@ found at
 #include <Library/PartitionTableUpdate.h>
 #include <Library/PcdLib.h>
 #include <Library/PrintLib.h>
+#include <Library/SfbSecurity.h>
 #include <Library/ThreadStack.h>
 #include <Library/UefiApplicationEntryPoint.h>
 #include <Library/UefiBootServicesTableLib.h>
@@ -303,14 +305,12 @@ UINTN GetXfrSize (VOID)
 STATIC VOID
 FastbootAck (IN CONST CHAR8 *code, CONST CHAR8 *Reason)
 {
-  if (Reason == NULL)
-    Reason = "";
-
-  AsciiSPrint (GetFastbootDeviceData ()->gTxBuffer, MAX_RSP_SIZE, "%a%a", code,
-               Reason);
+  /* gTxBuffer is a USB_BUFF_SIZE allocation, including room for the local
+   * terminator after a full 64-byte protocol response. */
+  UINTN Length = SfbFastbootEncodeResponse (
+      code, Reason, GetFastbootDeviceData ()->gTxBuffer);
   GetFastbootDeviceData ()->UsbDeviceProtocol->Send (
-      ENDPOINT_OUT, AsciiStrLen (GetFastbootDeviceData ()->gTxBuffer),
-      GetFastbootDeviceData ()->gTxBuffer);
+      ENDPOINT_OUT, Length, GetFastbootDeviceData ()->gTxBuffer);
   DEBUG ((EFI_D_VERBOSE, "Sending %d:%a\n",
           AsciiStrLen (GetFastbootDeviceData ()->gTxBuffer),
           GetFastbootDeviceData ()->gTxBuffer));
@@ -1275,6 +1275,9 @@ FetchParseHex (IN CONST CHAR8 *Token, OUT UINT64 *Value)
  * size to the rest of the partition. This is read-only - nothing on the device
  * is modified. The host upload phase (DATA + payload + OKAY) mirrors the
  * synchronous send used by CmdGetVarAll.
+ *
+ * The virtual partition "sb_challenge" streams the current authorization
+ * nonce instead; it stays available in locked mode.
  */
 STATIC VOID
 CmdFetch (IN CONST CHAR8 *arg, IN VOID *data, IN UINT32 sz)
@@ -1311,8 +1314,9 @@ CmdFetch (IN CONST CHAR8 *arg, IN VOID *data, IN UINT32 sz)
   }
   AsciiStrnCpyS (FetchArg, sizeof (FetchArg), arg, AsciiStrLen (arg));
 
-  /* Split "partition[:offset[:size]]". Qualcomm partition names never contain
-   * ':', so a left-to-right split is unambiguous. */
+  /* Split "partition[:offset[:size]]" first: the stock fastboot client
+   * appends ":0:<partition-size>" when it knows the size. Qualcomm partition
+   * names never contain ':', so a left-to-right split is unambiguous. */
   OffsetStr = AsciiStrStr (FetchArg, ":");
   if (OffsetStr != NULL) {
     *OffsetStr++ = '\0';
@@ -1338,8 +1342,47 @@ CmdFetch (IN CONST CHAR8 *arg, IN VOID *data, IN UINT32 sz)
     FastbootFail ("Invalid partition name");
     return;
   }
-  AsciiStrToUnicodeStr (FetchArg, PartitionName);
 
+  /* Virtual partition: the fastboot authorization challenge nonce. Only
+   * offset 0 and a size covering the whole nonce make sense. The host signs
+   * it and flashes the signature back as "flash sb_challenge.sig". */
+  if (AsciiStrCmp (FetchArg, "sb_challenge") == 0) {
+    CONST UINT8 *Nonce;
+
+    if ((SizeGiven && (ByteOffset != 0 ||
+                       RequestSize < SFB_SECURITY_CHALLENGE_SIZE))) {
+      FastbootFail ("Invalid challenge range");
+      return;
+    }
+    Nonce = SfbSecurityChallenge ();
+    TxBuffer = GetFastbootDeviceData ()->gTxBuffer;
+    AsciiSPrint (TxBuffer, MAX_RSP_SIZE, "DATA%08x",
+                 SFB_SECURITY_CHALLENGE_SIZE);
+    Status = GetFastbootDeviceData ()->UsbDeviceProtocol->Send (
+        ENDPOINT_OUT, AsciiStrLen (TxBuffer), TxBuffer);
+    if (Status != EFI_SUCCESS) {
+      FastbootFail ("Failed to send challenge header");
+      return;
+    }
+    WaitForTransferComplete ();
+    Status = GetFastbootDeviceData ()->UsbDeviceProtocol->Send (
+        ENDPOINT_OUT, SFB_SECURITY_CHALLENGE_SIZE, (UINT8 *)Nonce);
+    if (Status != EFI_SUCCESS) {
+      FastbootFail ("Failed to send challenge");
+      return;
+    }
+    WaitForTransferComplete ();
+    FastbootOkay ("");
+    return;
+  }
+
+  /* Locked mode exposes no partition reads beyond the challenge. */
+  if (SfbSecurityLocked ()) {
+    FastbootFail ("Device locked; only fetch:sb_challenge is available");
+    return;
+  }
+
+  AsciiStrToUnicodeStr (FetchArg, PartitionName);
   Status = PartitionGetInfo (PartitionName, &BlockIo, &Handle);
   if (Status != EFI_SUCCESS) {
     FastbootFail ("Partition not found");
@@ -1569,7 +1612,31 @@ CmdFlash (IN CONST CHAR8 *arg, IN VOID *data, IN UINT32 sz)
   }
   AsciiStrToUnicodeStr (arg, PartitionName);
 
- 
+  /* Virtual partition sb_challenge.sig: the authorization response. The
+   * downloaded buffer must hold a raw signature over the challenge nonce,
+   * verifiable under an AUTH_CERTS certificate. A successful check
+   * unlocks the mutating commands for the rest of the boot. */
+  if (StrnCmp (PartitionName, L"sb_challenge.sig",
+               StrLen (L"sb_challenge.sig")) == 0) {
+    if (!SfbSecurityAuthEnabled ()) {
+      FastbootFail ("No authorization configured");
+      return;
+    }
+    if (EFI_ERROR (SfbSecurityVerifyChallenge (mFlashDataBuffer,
+                                               (UINTN)mFlashNumDataBytes))) {
+      FastbootFail ("Challenge rejected");
+      return;
+    }
+    FastbootOkay ("Unlocked");
+    return;
+  }
+
+  /* Everything else that flashes requires authorization when locked. */
+  if (SfbSecurityLocked ()) {
+    FastbootFail ("Device locked; authorize via sb_challenge first");
+    return;
+  }
+
   /* Handle virtual partition avb_custom_key */
 
   /* Find the lun number from input string */
@@ -1758,6 +1825,11 @@ CmdErase (IN CONST CHAR8 *arg, IN VOID *data, IN UINT32 sz)
   CHAR16 PartitionName[MAX_GPT_NAME_SIZE];
 
   WaitForFlashFinished ();
+
+  if (SfbSecurityLocked ()) {
+    FastbootFail ("Device locked; authorize via sb_challenge first");
+    return;
+  }
 
   if (AsciiStrLen (arg) >= MAX_GPT_NAME_SIZE) {
     FastbootFail ("Invalid partition name");
@@ -2233,9 +2305,9 @@ FastbootCmdsInit (VOID)
   /* Clear allocated buffer */
   gBS->SetMem ((VOID *)FastBootBuffer, MaxUSBBufferSize , 0x0);
   DEBUG ((EFI_D_VERBOSE,
-                  "Fastboot Buffer Size allocated: %ld\n", MaxBufferSize));
+                  "Fastboot Buffer Size allocated: %ld\n", MaxUSBBufferSize));
 
-  MaxBufferSize = (CheckRootDeviceType () == NAND) ?
+  MaxUSBBufferSize = (CheckRootDeviceType () == NAND) ?
                               MaxUSBBufferSize : MaxUSBBufferSize / 2;
 
   FastbootCommandSetup ((VOID *)FastBootBuffer, MaxUSBBufferSize);
@@ -2297,26 +2369,45 @@ CmdReboot (IN CONST CHAR8 *arg, IN VOID *data, IN UINT32 sz)
   FastbootFail ("Failed to reboot");
 }
 
+/*
+ * Leave fastboot and hand control back to the boot menu, in answer to either
+ * "exit" or "oem exit" from the host. The OKAY must leave the wire before the
+ * gadget is torn down, so the transfer is drained before the request is made;
+ * the menu redraws once FastbootInitialize returns.
+ */
+STATIC VOID
+CmdExitToMenu (IN CONST CHAR8 *arg, IN VOID *data, IN UINT32 sz)
+{
+  (VOID)arg;
+  (VOID)data;
+  (VOID)sz;
+
+  DEBUG ((EFI_D_INFO, "exit to boot menu requested\n"));
+  FastbootOkay ("");
+  WaitForTransferComplete ();
+  FastbootRequestExitToMenu ();
+}
+
 STATIC VOID UpdateGetVarVariable (VOID)
 {
+}
+
+STATIC VOID
+FastbootGetVarInfo (CONST CHAR8 *Payload)
+{
+  FastbootInfo (Payload);
+  /* The next fragment must not overwrite an in-flight transfer buffer. */
+  WaitForTransferComplete ();
 }
 
 STATIC VOID CmdGetVarAll (VOID)
 {
   FASTBOOT_VAR *Var;
-  CHAR8 GetVarAll[MAX_RSP_SIZE];
 
-  for (Var = Varlist; Var; Var = Var->next) {
-    AsciiStrnCpyS (GetVarAll, sizeof (GetVarAll), Var->name, MAX_RSP_SIZE);
-    AsciiStrnCatS (GetVarAll, sizeof (GetVarAll), ":", AsciiStrLen (":"));
-    AsciiStrnCatS (GetVarAll, sizeof (GetVarAll), Var->value, MAX_RSP_SIZE);
-    FastbootInfo (GetVarAll);
-    /* Wait for the transfer to complete */
-    WaitForTransferComplete ();
-    ZeroMem (GetVarAll, sizeof (GetVarAll));
-  }
+  for (Var = Varlist; Var; Var = Var->next)
+    SfbFastbootGetVarInfo (Var->name, Var->value, FastbootGetVarInfo);
 
-  FastbootOkay (GetVarAll);
+  FastbootOkay ("");
 }
 
 STATIC VOID
@@ -2432,6 +2523,11 @@ CmdBoot (CONST CHAR8 *Arg, VOID *Data, UINT32 Size)
   boot_img_hdr *hdr = Data;
     VOID            *EfiData = NULL;
   UINT32           EfiSize = 0;
+
+  if (SfbSecurityLocked ()) {
+    FastbootFail ("Device locked; authorize via sb_challenge first");
+    return;
+  }
   /* ============================================
    * 新增：检测并处理 EFI 可执行文件
    * ============================================ */
@@ -2725,6 +2821,8 @@ FastbootCommandSetup (IN VOID *Base, IN UINT64 Size)
       {"boot", CmdBoot},
 #endif
       {"reboot", CmdReboot},
+      {"exit", CmdExitToMenu},
+      {"oem exit", CmdExitToMenu},
       {"getvar:", CmdGetVar},
       {"download:", CmdDownload},
   };
@@ -2735,6 +2833,19 @@ FastbootCommandSetup (IN VOID *Base, IN UINT64 Size)
                   sizeof (MaxBufferSizeStr), "%ld", MaxUSBBufferSize);
   FastbootPublishVar ("max-download-size", MaxBufferSizeStr);
   FastbootPublishVar ("max-fetch-size", MaxBufferSizeStr);
+
+  /* Virtual partition sb_challenge: the stock fastboot client queries
+   * partition-size/partition-type before fetching, and aborts with
+   * "Invalid partition size ... 0" when they are missing. PublishVar keeps
+   * shallow copies, so these values need their own static storage. */
+  {
+    STATIC CHAR8 SbChallengeSizeStr[16];
+
+    AsciiSPrint (SbChallengeSizeStr, sizeof (SbChallengeSizeStr), "%08x",
+                 SFB_SECURITY_CHALLENGE_SIZE);
+    FastbootPublishVar ("partition-size:sb_challenge", SbChallengeSizeStr);
+    FastbootPublishVar ("partition-type:sb_challenge", "raw");
+  }
 
   AsciiSPrint (FullProduct, sizeof (FullProduct), "%a", PRODUCT_NAME);
   FastbootPublishVar ("product", FullProduct);

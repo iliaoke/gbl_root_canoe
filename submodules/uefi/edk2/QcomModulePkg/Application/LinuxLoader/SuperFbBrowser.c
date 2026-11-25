@@ -23,10 +23,10 @@
 CONST CHAR8 *gSfbBrowserModuleTag = "SuperFbBrowser";
 
 /* Longest single file name we will read out of a directory. */
-#define SFB_NAME_CHARS  128
+#define SFB_DIR_NAME_CHARS  128
 
 typedef struct {
-  CHAR16   Name[SFB_NAME_CHARS];
+  CHAR16   Name[SFB_DIR_NAME_CHARS];
   BOOLEAN  IsDir;
   /* The synthetic ".." row: leaves the directory, or the volume when at root. */
   BOOLEAN  IsParent;
@@ -162,12 +162,12 @@ SfbReadDirectory (IN EFI_FILE_PROTOCOL  *Dir,
 
   /* The ".." row always exists: at the root it backs out to the volume list. */
   ZeroMem (&List[0], sizeof (List[0]));
-  StrCpyS (List[0].Name, SFB_NAME_CHARS, L"..");
+  StrCpyS (List[0].Name, SFB_DIR_NAME_CHARS, L"..");
   List[0].IsDir = TRUE;
   List[0].IsParent = TRUE;
   *Count = 1;
 
-  InfoSize = sizeof (EFI_FILE_INFO) + SFB_NAME_CHARS * sizeof (CHAR16);
+  InfoSize = sizeof (EFI_FILE_INFO) + SFB_DIR_NAME_CHARS * sizeof (CHAR16);
   Info = AllocateZeroPool (InfoSize);
   if (Info == NULL) {
     return EFI_OUT_OF_RESOURCES;
@@ -220,8 +220,8 @@ SfbReadDirectory (IN EFI_FILE_PROTOCOL  *Dir,
     }
 
     ZeroMem (&List[*Count], sizeof (List[0]));
-    StrnCpyS (List[*Count].Name, SFB_NAME_CHARS, Info->FileName,
-              SFB_NAME_CHARS - 1);
+    StrnCpyS (List[*Count].Name, SFB_DIR_NAME_CHARS, Info->FileName,
+              SFB_DIR_NAME_CHARS - 1);
     List[*Count].IsDir =
       (BOOLEAN)((Info->Attribute & EFI_FILE_DIRECTORY) != 0);
     (*Count)++;
@@ -331,7 +331,7 @@ SfbEfiActionMenu (IN EFI_HANDLE   Volume,
                   IN CONST CHAR16 *Name)
 {
   STATIC CONST CHAR16  *Actions[] = {
-    L"Boot (temporary)",
+    L"Boot",
     L"Add to BootMenu",
     L"Back"
   };
@@ -376,9 +376,8 @@ SfbEfiActionMenu (IN EFI_HANDLE   Volume,
     }
 
     if (Cursor == 0) {
-      /* Temporary: deliberately does not touch the default-entry variable.
-       * Menu-driven launch, so clear the screen for the "Booting" banner. */
-      Status = SfbLaunchEntry (&Entry, TRUE, TRUE);
+      /* Menu-driven launch, so clear the screen for the "Booting" banner. */
+      Status = SfbLaunchEntry (&Entry, TRUE, NULL);
       if (EFI_ERROR (Status)) {
         SfbReportStatus (L"Boot failed", Status);
       }
@@ -386,25 +385,33 @@ SfbEfiActionMenu (IN EFI_HANDLE   Volume,
     }
 
     if (Cursor == 1) {
-      Status = SfbSaveCustomEntry (&Entry);
-      if (EFI_ERROR (Status)) {
-        SfbReportStatus (L"Could not save entry", Status);
-        continue;
+      SFB_ENTRY_LIST  *List = SfbEntries ();
+
+      /* Appended at the end of the boot order and stored straight away. */
+      if (List == NULL || !SfbEntryListAppend (List, &Entry)) {
+        SfbReportStatus (L"Already listed or list full", EFI_ALREADY_STARTED);
+        return FALSE;
       }
-      SfbReportStatus (L"Added to boot menu", Status);
-      SfbFreeEntry (&Entry);
+      Status = SfbWriteStoredEntries (List);
+      SfbReportStatus (EFI_ERROR (Status) ? L"Added, but could not be stored"
+                                          : L"Added to boot menu",
+                       Status);
       return TRUE;
     }
 
-    SfbFreeEntry (&Entry);
+    if (Entry.DevicePath != NULL) {
+      FreePool (Entry.DevicePath);
+    }
     return FALSE;
   }
 }
 
 /* ---- directory navigation ----------------------------------------------- */
 
-/* Returns TRUE when the browser should unwind back to the boot menu. */
-STATIC
+/*
+ * Returns TRUE when the browser should unwind back to the boot menu. Public:
+ * the Advanced volume browser opens individual volumes through it.
+ */
 BOOLEAN
 SfbBrowseVolume (IN EFI_HANDLE   Volume,
                  IN CONST CHAR16 *VolumeLabel,
@@ -423,9 +430,8 @@ SfbBrowseVolume (IN EFI_HANDLE   Volume,
     return FALSE;
   }
 
-  /* Start at the volume's browse root: "\" for FAT32, "\efisp" for the ext4
-   * persist volume. It is also the floor: ".." there backs out to the volume
-   * list rather than climbing above it. */
+  /* Start at the browse root. It is also the floor: ".." there backs out to
+   * the volume list rather than climbing above it. */
   StrCpyS (Path, SFB_PATH_CHARS, BrowseRoot);
 
   while (TRUE) {
@@ -564,12 +570,20 @@ SfbRunFileBrowser (VOID)
   UINTN           Cursor = 0;
   UINTN           Index;
 
+  SfbShowEnteringScreen (L"File Browser");
+
   /* Media may have been inserted since the loader started. */
   SfbStartFatStack ();
 
+  /*
+   * The browser lists the UFS partition table plus the config container -
+   * SfbLocateVolumes () IS the volume list. Firmware volumes, USB media and
+   * other non-UFS disks are never part of it. Browsing always starts at the
+   * volume's own root.
+   */
   Status = SfbLocateVolumes (&Volumes, &VolumeCount);
   if (EFI_ERROR (Status) || Volumes == NULL || VolumeCount == 0) {
-    SfbReportStatus (L"No FAT32 volumes found",
+    SfbReportStatus (L"No file system volumes found",
                      EFI_ERROR (Status) ? Status : EFI_NOT_FOUND);
     if (Volumes != NULL) {
       FreePool (Volumes);
@@ -622,7 +636,7 @@ SfbRunFileBrowser (VOID)
     UINTN    Last;
     SFB_KEY  Key;
 
-    SfbBeginScreen (L"EFI Program Selector", L"Choose a FAT32 volume to browse.");
+    SfbBeginScreen (L"EFI Program Selector", L"Choose a volume to browse.");
 
     Start = SfbWindowStart (Cursor, RowCount, SFB_VISIBLE_ROWS);
     Last = Start + SFB_VISIBLE_ROWS;
@@ -651,19 +665,13 @@ SfbRunFileBrowser (VOID)
     }
 
     if (Cursor == VolumeCount) {
+      SfbDebounceMenuExit ();
       break;
     }
 
-    {
-      /* Browse from the volume's root: "\" for FAT32, "\efisp" for the ext4
-       * persist volume. SfbVolumeRootPrefix gives "" for FAT32, which here
-       * means the plain volume root. */
-      CONST CHAR16  *Prefix = SfbVolumeRootPrefix (Volumes[Cursor]);
-      CONST CHAR16  *BrowseRoot = (Prefix[0] == L'\0') ? L"\\" : Prefix;
-
-      if (SfbBrowseVolume (Volumes[Cursor], Rows[Cursor].Label, BrowseRoot)) {
-        break;
-      }
+    /* Every volume is browsed from its own root, FAT and ext4 alike. */
+    if (SfbBrowseVolume (Volumes[Cursor], Rows[Cursor].Label, L"\\")) {
+      break;
     }
   }
 
